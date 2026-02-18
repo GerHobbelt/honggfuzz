@@ -46,9 +46,9 @@ __attribute__((used)) const char* const LIBHFUZZ_module_instrument = "LIBHFUZZ_m
  */
 static feedback_t bbMapFb;
 
-feedback_t*    globalCovFeedback = &bbMapFb;
-feedback_t*    localCovFeedback  = &bbMapFb;
-cmpfeedback_t* globalCmpFeedback = NULL;
+feedback_t*  globalCovFeedback = &bbMapFb;
+feedback_t*  localCovFeedback  = &bbMapFb;
+fuzz_data_t* globalCmpFeedback = NULL;
 
 uint32_t my_thread_no = 0;
 
@@ -158,17 +158,17 @@ static void initializeCmpFeedback(void) {
     if (fstat(_HF_CMP_BITMAP_FD, &st) == -1) {
         return;
     }
-    if (st.st_size != sizeof(cmpfeedback_t)) {
+    if (st.st_size != sizeof(fuzz_data_t)) {
         LOG_W(
-            "Size of the globalCmpFeedback structure mismatch: st.size != sizeof(cmpfeedback_t) "
+            "Size of the globalCmpFeedback structure mismatch: st.size != sizeof(fuzz_data_t) "
             "(%zu != %zu). Link your fuzzed binaries with the newest honggfuzz and hfuzz-clang(++)",
-            (size_t)st.st_size, sizeof(cmpfeedback_t));
+            (size_t)st.st_size, sizeof(fuzz_data_t));
         return;
     }
-    void* ret = initializeTryMapHugeTLB(_HF_CMP_BITMAP_FD, sizeof(cmpfeedback_t));
+    void* ret = initializeTryMapHugeTLB(_HF_CMP_BITMAP_FD, sizeof(fuzz_data_t));
     if (ret == MAP_FAILED) {
         PLOG_W("mmap(_HF_CMP_BITMAP_FD=%d, size=%zu) of the feedback structure failed",
-            _HF_CMP_BITMAP_FD, sizeof(cmpfeedback_t));
+            _HF_CMP_BITMAP_FD, sizeof(fuzz_data_t));
         return;
     }
     ATOMIC_SET(globalCmpFeedback, ret);
@@ -295,39 +295,62 @@ void instrumentResetLocalCovFeedback(void) {
 
 /* Used to limit certain expensive actions, like adding values to dictionaries */
 static inline bool instrumentLimitEvery(uint64_t step) {
+    static uint64_t counter = 0;
+    uint64_t        val     = __atomic_add_fetch(&counter, 1, __ATOMIC_RELAXED);
     if (((step + 1) & step) == 0) {
-        return ((util_rnd64() & step) == 0);
+        return ((val & step) == 0);
     }
-    return (util_rndGet(0, step) == 0);
+    return ((val % (step + 1)) == 0);
 }
 
 static inline void instrumentAddConstMemInternal(const void* mem, size_t len) {
     if (len <= 1) {
         return;
     }
-    if (len > sizeof(globalCmpFeedback->valArr[0].val)) {
-        len = sizeof(globalCmpFeedback->valArr[0].val);
+    if (len > sizeof(globalCmpFeedback->dict[0].val)) {
+        len = sizeof(globalCmpFeedback->dict[0].val);
     }
 
-    const uint32_t arrSize = ARRAYSIZE(globalCmpFeedback->valArr);
-    uint32_t       curroff = ATOMIC_GET(globalCmpFeedback->cnt);
+    const uint32_t arrSize   = ARRAYSIZE(globalCmpFeedback->dict);
+    const uint32_t staticCnt = globalCmpFeedback->dictStaticCnt;
+    uint32_t       curroff   = ATOMIC_GET(globalCmpFeedback->dictCnt);
 
-    uint32_t scanLimit = (curroff < arrSize) ? curroff : arrSize;
-    uint32_t scanStart = (curroff > scanLimit) ? (curroff - scanLimit) : 0;
+    uint32_t checkCnt  = 16384;
+    uint32_t scanLimit = (curroff < checkCnt) ? curroff : checkCnt;
+    uint32_t scanStart = curroff - scanLimit;
+
     for (uint32_t i = scanStart; i < curroff; i++) {
-        uint32_t idx = i % arrSize;
-        if ((len == ATOMIC_GET(globalCmpFeedback->valArr[idx].len)) &&
-            hf_memcmp(globalCmpFeedback->valArr[idx].val, mem, len) == 0) {
+        uint32_t idx;
+        if (i < arrSize) {
+            idx = i;
+        } else {
+            uint32_t dynSz = arrSize - staticCnt;
+            if (dynSz == 0)
+                idx = 0;
+            else
+                idx = staticCnt + ((i - arrSize) % dynSz);
+        }
+
+        if ((len == ATOMIC_GET(globalCmpFeedback->dict[idx].len)) &&
+            hf_memcmp(globalCmpFeedback->dict[idx].val, mem, len) == 0) {
             return;
         }
     }
 
-    /* Ring buffer: wrap around when full */
-    uint32_t newoff = ATOMIC_POST_INC(globalCmpFeedback->cnt);
-    uint32_t idx    = newoff % arrSize;
+    uint32_t newoff = ATOMIC_POST_INC(globalCmpFeedback->dictCnt);
+    uint32_t idx;
+    if (newoff < arrSize) {
+        idx = newoff;
+    } else {
+        uint32_t dynSz = arrSize - staticCnt;
+        if (dynSz == 0)
+            idx = 0;
+        else
+            idx = staticCnt + ((newoff - arrSize) % dynSz);
+    }
 
-    memcpy(globalCmpFeedback->valArr[idx].val, mem, len);
-    ATOMIC_SET(globalCmpFeedback->valArr[idx].len, len);
+    memcpy(globalCmpFeedback->dict[idx].val, mem, len);
+    ATOMIC_SET(globalCmpFeedback->dict[idx].len, len);
 }
 
 /*
@@ -439,21 +462,62 @@ void __sanitizer_cov_trace_cmp2(uint16_t Arg1, uint16_t Arg2) {
     hfuzz_trace_cmp2_internal((uintptr_t)__builtin_return_address(0), Arg1, Arg2);
 }
 
+/*
+ * Check if the value should be added to the dynamic dictionary.
+ * Skip small values (likely counters, small sizes) to avoid pollution.
+ */
+__attribute__((always_inline)) static inline bool instrumentValueInteresting(uint64_t val) {
+    if (val <= 0xFFFF) {
+        return false;
+    }
+    return true;
+}
+
+static bool instrument32bitValInBinary(uint32_t v) {
+    if (!globalCmpFeedback || globalCmpFeedback->ro32Cnt == 0) {
+        return false;
+    }
+    size_t lo = 0, hi = globalCmpFeedback->ro32Cnt;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (globalCmpFeedback->ro32[mid] < v) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return (lo < globalCmpFeedback->ro32Cnt && globalCmpFeedback->ro32[lo] == v);
+}
+
+static bool instrument64bitValInBinary(uint64_t v) {
+    if (!globalCmpFeedback || globalCmpFeedback->ro64Cnt == 0) {
+        return false;
+    }
+    size_t lo = 0, hi = globalCmpFeedback->ro64Cnt;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (globalCmpFeedback->ro64[mid] < v) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return (lo < globalCmpFeedback->ro64Cnt && globalCmpFeedback->ro64[lo] == v);
+}
+
 void __sanitizer_cov_trace_cmp4(uint32_t Arg1, uint32_t Arg2) {
     /* Add 4byte values to the const_dictionary if they exist within the binary */
-    if (globalCmpFeedback && instrumentLimitEvery(4095)) {
-        if (Arg1 > 0xffff) {
-            uint32_t bswp = __builtin_bswap32(Arg1);
-            if (util_32bitValInBinary(Arg1) || util_32bitValInBinary(bswp)) {
-                instrumentAddConstMemInternal(&Arg1, sizeof(Arg1));
-                instrumentAddConstMemInternal(&bswp, sizeof(bswp));
+    if (globalCmpFeedback) {
+        if (instrumentLimitEvery(16383)) {
+            if (instrumentValueInteresting(Arg1)) {
+                if (instrument32bitValInBinary(Arg1)) {
+                    instrumentAddConstMemInternal(&Arg1, sizeof(Arg1));
+                }
             }
-        }
-        if (Arg2 > 0xffff) {
-            uint32_t bswp = __builtin_bswap32(Arg2);
-            if (util_32bitValInBinary(Arg2) || util_32bitValInBinary(bswp)) {
-                instrumentAddConstMemInternal(&Arg2, sizeof(Arg2));
-                instrumentAddConstMemInternal(&bswp, sizeof(bswp));
+            if (instrumentValueInteresting(Arg2)) {
+                if (instrument32bitValInBinary(Arg2)) {
+                    instrumentAddConstMemInternal(&Arg2, sizeof(Arg2));
+                }
             }
         }
     }
@@ -463,19 +527,17 @@ void __sanitizer_cov_trace_cmp4(uint32_t Arg1, uint32_t Arg2) {
 
 void __sanitizer_cov_trace_cmp8(uint64_t Arg1, uint64_t Arg2) {
     /* Add 8byte values to the const_dictionary if they exist within the binary */
-    if (globalCmpFeedback && instrumentLimitEvery(4095)) {
-        if (Arg1 > 0xffffff) {
-            uint64_t bswp = __builtin_bswap64(Arg1);
-            if (util_64bitValInBinary(Arg1) || util_64bitValInBinary(bswp)) {
-                instrumentAddConstMemInternal(&Arg1, sizeof(Arg1));
-                instrumentAddConstMemInternal(&bswp, sizeof(bswp));
+    if (globalCmpFeedback) {
+        if (instrumentLimitEvery(16383)) {
+            if (instrumentValueInteresting(Arg1)) {
+                if (instrument64bitValInBinary(Arg1)) {
+                    instrumentAddConstMemInternal(&Arg1, sizeof(Arg1));
+                }
             }
-        }
-        if (Arg2 > 0xffffff) {
-            uint64_t bswp = __builtin_bswap64(Arg2);
-            if (util_64bitValInBinary(Arg2) || util_64bitValInBinary(bswp)) {
-                instrumentAddConstMemInternal(&Arg2, sizeof(Arg2));
-                instrumentAddConstMemInternal(&bswp, sizeof(bswp));
+            if (instrumentValueInteresting(Arg2)) {
+                if (instrument64bitValInBinary(Arg2)) {
+                    instrumentAddConstMemInternal(&Arg2, sizeof(Arg2));
+                }
             }
         }
     }
@@ -489,43 +551,19 @@ void __sanitizer_cov_trace_const_cmp1(uint8_t Arg1, uint8_t Arg2) {
 }
 
 void __sanitizer_cov_trace_const_cmp2(uint16_t Arg1, uint16_t Arg2) {
-    if (globalCmpFeedback && instrumentLimitEvery(4095)) {
-        if (util_16bitValInBinary(Arg1)) {
+    if (globalCmpFeedback) {
+        if (instrumentLimitEvery(16383)) {
             instrumentAddConstMemInternal(&Arg1, sizeof(Arg1));
-        } else {
-            uint16_t bswp = __builtin_bswap16(Arg1);
-            if (util_16bitValInBinary(bswp)) {
-                instrumentAddConstMemInternal(&bswp, sizeof(bswp));
-            }
-        }
-        if (util_16bitValInBinary(Arg2)) {
-            instrumentAddConstMemInternal(&Arg2, sizeof(Arg2));
-        } else {
-            uint16_t bswp = __builtin_bswap16(Arg2);
-            if (util_16bitValInBinary(bswp)) {
-                instrumentAddConstMemInternal(&bswp, sizeof(bswp));
-            }
         }
     }
     hfuzz_trace_cmp2_internal((uintptr_t)__builtin_return_address(0), Arg1, Arg2);
 }
 
 void __sanitizer_cov_trace_const_cmp4(uint32_t Arg1, uint32_t Arg2) {
-    if (globalCmpFeedback && instrumentLimitEvery(4095)) {
-        if (util_32bitValInBinary(Arg1)) {
-            instrumentAddConstMemInternal(&Arg1, sizeof(Arg1));
-        } else {
-            uint32_t bswp = __builtin_bswap32(Arg1);
-            if (util_32bitValInBinary(bswp)) {
-                instrumentAddConstMemInternal(&bswp, sizeof(bswp));
-            }
-        }
-        if (util_32bitValInBinary(Arg2)) {
-            instrumentAddConstMemInternal(&Arg2, sizeof(Arg2));
-        } else {
-            uint32_t bswp = __builtin_bswap32(Arg2);
-            if (util_32bitValInBinary(bswp)) {
-                instrumentAddConstMemInternal(&bswp, sizeof(bswp));
+    if (globalCmpFeedback) {
+        if (instrumentLimitEvery(16383)) {
+            if (instrumentValueInteresting(Arg1)) {
+                instrumentAddConstMemInternal(&Arg1, sizeof(Arg1));
             }
         }
     }
@@ -533,21 +571,10 @@ void __sanitizer_cov_trace_const_cmp4(uint32_t Arg1, uint32_t Arg2) {
 }
 
 void __sanitizer_cov_trace_const_cmp8(uint64_t Arg1, uint64_t Arg2) {
-    if (globalCmpFeedback && instrumentLimitEvery(4095)) {
-        if (util_64bitValInBinary(Arg1)) {
-            instrumentAddConstMemInternal(&Arg1, sizeof(Arg1));
-        } else {
-            uint64_t bswp = __builtin_bswap64(Arg1);
-            if (util_64bitValInBinary(bswp)) {
-                instrumentAddConstMemInternal(&bswp, sizeof(bswp));
-            }
-        }
-        if (util_64bitValInBinary(Arg2)) {
-            instrumentAddConstMemInternal(&Arg2, sizeof(Arg2));
-        } else {
-            uint64_t bswp = __builtin_bswap64(Arg2);
-            if (util_64bitValInBinary(bswp)) {
-                instrumentAddConstMemInternal(&bswp, sizeof(bswp));
+    if (globalCmpFeedback) {
+        if (instrumentLimitEvery(16383)) {
+            if (instrumentValueInteresting(Arg1)) {
+                instrumentAddConstMemInternal(&Arg1, sizeof(Arg1));
             }
         }
     }
@@ -610,20 +637,12 @@ HF_REQUIRE_SSE42_POPCNT void __sanitizer_cov_trace_switch(uint64_t Val, uint64_t
 
     size_t len = (size_t)(bits / 8);
 
-    if (globalCmpFeedback && len > 1 && instrumentLimitEvery(4095)) {
+    if (globalCmpFeedback && len > 1 && instrumentLimitEvery(16383)) {
         uint64_t limit = (cnt < 16) ? cnt : 16;
         for (uint64_t i = 0; i < limit; i++) {
             uint64_t cval = Cases[i + 2];
-            instrumentAddConstMemInternal(&cval, len);
-            if (len == 2) {
-                uint16_t bswp16 = __builtin_bswap16((uint16_t)cval);
-                instrumentAddConstMemInternal(&bswp16, len);
-            } else if (len == 4) {
-                uint32_t bswp32 = __builtin_bswap32((uint32_t)cval);
-                instrumentAddConstMemInternal(&bswp32, len);
-            } else if (len == 8) {
-                uint64_t bswp64 = __builtin_bswap64(cval);
-                instrumentAddConstMemInternal(&bswp64, len);
+            if (instrumentValueInteresting(cval)) {
+                instrumentAddConstMemInternal(&cval, len);
             }
         }
     }
@@ -1010,10 +1029,7 @@ void instrumentAddConstMem(const void* mem, size_t len, bool check_if_ro) {
         return;
     }
 
-    uint32_t cnt = ATOMIC_GET(globalCmpFeedback->cnt);
-    /* If the dictionary is still relatively empty, be more aggressive with adding new entries */
-    uint64_t step = (cnt < 2048) ? 7 : 127;
-    if (!instrumentLimitEvery(step)) {
+    if (!instrumentLimitEvery(16383)) {
         return;
     }
     if (check_if_ro && util_getProgAddr(mem) == LHFC_ADDR_NOTFOUND) {
@@ -1026,10 +1042,7 @@ void instrumentAddConstStr(const char* s) {
     if (!globalCmpFeedback) {
         return;
     }
-    uint32_t cnt = ATOMIC_GET(globalCmpFeedback->cnt);
-    /* If the dictionary is still relatively empty, be more aggressive with adding new entries */
-    uint64_t step = (cnt < 2048) ? 7 : 127;
-    if (!instrumentLimitEvery(step)) {
+    if (!instrumentLimitEvery(16383)) {
         return;
     }
 
@@ -1052,10 +1065,7 @@ void instrumentAddConstStrN(const char* s, size_t n) {
     if (n <= 1) {
         return;
     }
-    uint32_t cnt = ATOMIC_GET(globalCmpFeedback->cnt);
-    /* If the dictionary is still relatively empty, be more aggressive with adding new entries */
-    uint64_t step = (cnt < 2048) ? 7 : 127;
-    if (!instrumentLimitEvery(step)) {
+    if (!instrumentLimitEvery(16383)) {
         return;
     }
     if (util_getProgAddr(s) == LHFC_ADDR_NOTFOUND) {
