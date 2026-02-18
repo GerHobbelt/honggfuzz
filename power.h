@@ -1,11 +1,11 @@
 /*
  *
- * honggfuzz - architecture dependent code (LINUX/PERF)
+ * honggfuzz - power schedule calculation
  * -----------------------------------------
  *
  * Author: Robert Swiecki <swiecki@google.com>
  *
- * Copyright 2010-2018 by Google Inc. All Rights Reserved.
+ * Copyright 2025 by Google Inc. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License"); you may
  * not use this file except in compliance with the License. You may obtain
@@ -21,17 +21,14 @@
  *
  */
 
-#ifndef _HF_LINUX_PERF_H_
-#define _HF_LINUX_PERF_H_
+#ifndef _HF_POWER_H_
+#define _HF_POWER_H_
 
 #include "honggfuzz.h"
 
-extern bool arch_perfInit(honggfuzz_t* hfuzz);
-extern bool arch_perfOpen(run_t* run);
-extern void arch_perfClose(run_t* run);
-extern bool arch_perfEnable(run_t* run);
-extern void arch_perfAnalyze(run_t* run);
+/* The baseline energy level. Input with this energy will be fuzzed exactly once. */
+#define POWER_BASE_ENERGY 256
 
-#define _HF_PERF_AUX_SZ (1024 * 1024)
+extern uint64_t power_calculateEnergy(run_t* run, dynfile_t* dynfile);
 
-#endif
+#endif /* _HF_POWER_H_ */

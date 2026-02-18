@@ -40,6 +40,7 @@
 #endif
 
 #include "cmdline.h"
+#include "dict.h"
 #include "display.h"
 #include "fuzz.h"
 #include "input.h"
@@ -49,6 +50,10 @@
 #include "libhfcommon/util.h"
 #include "socketfuzzer.h"
 #include "subproc.h"
+
+#if defined(_HF_ARCH_LINUX) && !defined(_HF_LINUX_NO_BFD)
+#include "linux/bfd.h"
+#endif
 
 static int  sigReceived = 0;
 static bool clearWin    = false;
@@ -388,6 +393,19 @@ int main(int argc, char** argv) {
 
     if (hfuzz.mutate.dictionaryFile && !input_parseDictionary(&hfuzz)) {
         LOG_F("Couldn't parse dictionary file ('%s')", hfuzz.mutate.dictionaryFile);
+    }
+
+#if defined(_HF_ARCH_LINUX) && !defined(_HF_LINUX_NO_BFD)
+    /* Extract tokens from parser generator string arrays (Lemon/Bison/Yacc) */
+    arch_bfdExtractStrArray(&hfuzz, "yyTokenName"); /* Lemon */
+    arch_bfdExtractStrArray(&hfuzz, "yytname");     /* Bison/Yacc */
+    /* Scan .rodata for other string pointer arrays */
+    arch_bfdExtractRodataStrArrays(&hfuzz);
+#endif
+
+    /* Log dictionary stats after all sources have been processed */
+    if (hfuzz.mutate.dictionaryCnt > 0) {
+        dict_logStats(&hfuzz);
     }
 
     if (hfuzz.feedback.blocklistFile && !input_parseBlacklist(&hfuzz)) {

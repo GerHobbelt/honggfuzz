@@ -452,12 +452,14 @@ static void commonPostOpts(int* j, char** args) {
                 args[(*j)++] = "-fno-sanitize=fuzzer";
                 args[(*j)++] = "-fno-sanitize=fuzzer-no-link";
             }
-            args[(*j)++] = "-fsanitize-coverage=trace-pc-guard,trace-cmp,trace-div,indirect-calls";
+            args[(*j)++] = "-fsanitize-coverage=trace-pc-guard,trace-cmp,trace-div,indirect-calls,"
+                           "trace-gep,stack-depth";
         } else {
             args[(*j)++] = "-fno-sanitize-coverage=trace-pc-guard";
             args[(*j)++] = "-fno-sanitize=fuzzer";
             args[(*j)++] = "-fsanitize=fuzzer-no-link";
-            args[(*j)++] = "-fsanitize-coverage=trace-cmp,trace-div,indirect-calls";
+            args[(*j)++] =
+                "-fsanitize-coverage=trace-cmp,trace-div,indirect-calls,trace-gep,stack-depth";
         }
     }
 }
@@ -510,7 +512,13 @@ static int ldMode(int argc, char** argv) {
     args[j++] = "-Wl,--wrap=bcmp";
     args[j++] = "-Wl,--wrap=memmem";
     args[j++] = "-Wl,--wrap=strcpy";
+    args[j++] = "-Wl,--wrap=strcat";
     args[j++] = "-Wl,--wrap=strlcpy";
+    args[j++] = "-Wl,--wrap=strlcat";
+    args[j++] = "-Wl,--wrap=strspn";
+    args[j++] = "-Wl,--wrap=strcspn";
+    args[j++] = "-Wl,--wrap=strpbrk";
+    args[j++] = "-Wl,--wrap=strncat";
     /* Apache httpd */
     args[j++] = "-Wl,--wrap=ap_cstr_casecmp";
     args[j++] = "-Wl,--wrap=ap_cstr_casecmpn";
